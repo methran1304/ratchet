@@ -1,0 +1,50 @@
+{
+  "name": "@methran1304/ratchet",
+  "version": "0.1.0",
+  "description": "Checkpointed, resumable multi-step pipelines with indefinite human-approval interrupts. LangGraph semantics without a graph VM.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Methran",
+  "exports": {
+    ".": "./dist/index.js",
+    "./traces": "./dist/traces/index.js"
+  },
+  "files": [
+    "dist",
+    "schema"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "workflow",
+    "durable-execution",
+    "checkpoint",
+    "saga",
+    "human-in-the-loop",
+    "postgres",
+    "tracing"
+  ],
+  "peerDependencies": {
+    "pg": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/pg": "^8.21.0",
+    "pg": "^8.23.0",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.10"
+  }
+}
