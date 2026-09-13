@@ -334,3 +334,98 @@ describe("pipeline runner", () => {
     expect((await store.loadRun(outcome.runId))?.trace_id).toBe(ordered[0].trace_id);
   });
 });
+
+describe("checkpoint atomicity", () => {
+  /**
+   * Wraps the in-memory store and records which store methods the runner calls,
+   * so a test can assert HOW the checkpoint is written rather than only what it
+   * ends up saying.
+   */
+  class RecordingStore extends InMemoryPipelineStore {
+    readonly calls: string[] = [];
+    failCommitOnIndex: number | null = null;
+    /** commitStep delegates to recordStep internally; only log the outer call. */
+    private inCommit = false;
+
+    override async recordStep(step: Parameters<InMemoryPipelineStore["recordStep"]>[0]) {
+      if (!this.inCommit) this.calls.push(`recordStep:${step.status}:${step.step_index}`);
+      return super.recordStep(step);
+    }
+
+    override async commitStep(
+      step: Parameters<InMemoryPipelineStore["commitStep"]>[0],
+      patch: Parameters<InMemoryPipelineStore["commitStep"]>[1],
+    ) {
+      if (this.failCommitOnIndex === step.step_index) {
+        // Stand in for the process dying mid-write. Neither half may land.
+        this.calls.push(`commitStep:CRASH:${step.step_index}`);
+        throw new Error("connection terminated");
+      }
+      this.calls.push(`commitStep:${step.status}:${step.step_index}`);
+      this.inCommit = true;
+      try {
+        return await super.commitStep(step, patch);
+      } finally {
+        this.inCommit = false;
+      }
+    }
+  }
+
+  const twoSteps = (ran: string[]) =>
+    definePipeline<State>({
+      name: "atomic",
+      version: "1",
+      steps: [
+        {
+          name: "one",
+          run: (s) => {
+            ran.push("one");
+            return { ...s, items: [...s.items, "one"] };
+          },
+        },
+        {
+          name: "two",
+          run: (s) => {
+            ran.push("two");
+            return { ...s, items: [...s.items, "two"] };
+          },
+        },
+      ],
+    });
+
+  it("writes a completed step and its cursor advance as a single store call", async () => {
+    // The gap this closes: recordStep("ok") followed by a separate updateRun
+    // left a window where a crash between them meant the step read as done
+    // while the cursor still pointed at it, so resume re-ran a side effect
+    // that had already happened.
+    const store = new RecordingStore();
+    const ran: string[] = [];
+    await startPipeline(twoSteps(ran), { store, initialState: { items: [] }, ...deps });
+
+    expect(store.calls).toEqual(["commitStep:ok:0", "commitStep:ok:1"]);
+    expect(store.calls.some((c) => c.startsWith("recordStep:ok"))).toBe(false);
+  });
+
+  it("leaves no half-applied checkpoint when the commit itself fails", async () => {
+    const store = new RecordingStore();
+    store.failCommitOnIndex = 0;
+    const ran: string[] = [];
+
+    const outcome = await startPipeline(twoSteps(ran), {
+      store,
+      initialState: { items: [] },
+      ...deps,
+    });
+
+    expect(outcome.status).toBe("failed");
+    // Step one's side effect ran, but nothing about it was recorded, so the
+    // stored state is consistent: cursor still at 0, no "ok" row at 0.
+    const run = await store.loadRun(outcome.runId);
+    expect(run?.step_index).toBe(0);
+    expect(store.steps.filter((s) => s.run_id === outcome.runId && s.status === "ok")).toHaveLength(
+      0,
+    );
+    // And step two never started, because step one never committed.
+    expect(ran).toEqual(["one"]);
+  });
+});

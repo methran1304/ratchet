@@ -220,25 +220,25 @@ async function drive<S extends PipelineState>(
         );
         if (next !== undefined) state = next;
         const completedAt = deps.now();
-        await store.recordStep({
-          run_id: run.run_id,
-          step_name: step.name,
-          step_index: index,
-          attempt,
-          status: "ok",
-          state_after: state,
-          error: null,
-          started_at: startedAt,
-          completed_at: completedAt,
-          latency_ms: Math.max(0, completedAt.getTime() - startedAt.getTime()),
-        });
-        // THE checkpoint: state + cursor advance atomically from the
-        // caller's perspective before the next step begins.
-        await store.updateRun(run.run_id, {
-          state,
-          step_index: index + 1,
-          current_step: step.name,
-        });
+        // THE checkpoint. One write, so the step row and the cursor land
+        // together: a crash between them would leave the step recorded "ok"
+        // with step_index still pointing at it, and resume would re-run a side
+        // effect that already happened.
+        await store.commitStep(
+          {
+            run_id: run.run_id,
+            step_name: step.name,
+            step_index: index,
+            attempt,
+            status: "ok",
+            state_after: state,
+            error: null,
+            started_at: startedAt,
+            completed_at: completedAt,
+            latency_ms: Math.max(0, completedAt.getTime() - startedAt.getTime()),
+          },
+          { state, step_index: index + 1, current_step: step.name },
+        );
         stepSpan.end({ outputs: { attempt } });
         stepDone = true;
       } catch (err) {

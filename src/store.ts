@@ -42,6 +42,18 @@ export interface PipelineStore {
     >,
   ): Promise<void>;
   recordStep(step: StepRecord): Promise<void>;
+  /**
+   * Record a completed step AND advance the run cursor as one durable write.
+   *
+   * These were two separate queries, which left a window: crash after the step
+   * row said "ok" but before step_index moved, and resume re-ran a step whose
+   * side effect had already happened. That is the exact thing a checkpointing
+   * library exists to prevent, so it has to be one statement.
+   */
+  commitStep(
+    step: StepRecord,
+    runPatch: Parameters<PipelineStore["updateRun"]>[1],
+  ): Promise<void>;
   createInterrupt(interrupt: InterruptRecord): Promise<void>;
   /** Latest interrupt for (runId, stepName, reason), any status. */
   findInterrupt(runId: string, stepName: string, reason: string): Promise<InterruptRecord | null>;
@@ -97,6 +109,16 @@ export class InMemoryPipelineStore implements PipelineStore {
   async recordStep(step: StepRecord): Promise<void> {
     if (step.state_after) assertStateSize(step.state_after);
     this.steps.push({ ...step });
+  }
+
+  async commitStep(
+    step: StepRecord,
+    runPatch: Parameters<PipelineStore["updateRun"]>[1],
+  ): Promise<void> {
+    // No crash window to close in-process: nothing can interleave between these
+    // two synchronous mutations.
+    await this.recordStep(step);
+    await this.updateRun(step.run_id, runPatch);
   }
 
   async createInterrupt(interrupt: InterruptRecord): Promise<void> {
@@ -239,9 +261,15 @@ export class PgPipelineStore implements PipelineStore {
     return res.rows[0] ? rowToRun(res.rows[0]) : null;
   }
 
-  async updateRun(runId: string, patch: Parameters<PipelineStore["updateRun"]>[1]): Promise<void> {
+  /**
+   * Build the SET clause for a run patch. `values` starts with the run id at $1
+   * and is appended to, so a caller can keep binding after it (see commitStep).
+   */
+  private runPatchSets(
+    patch: Parameters<PipelineStore["updateRun"]>[1],
+    values: unknown[],
+  ): string[] {
     const sets: string[] = ["updated_at = NOW()"];
-    const values: unknown[] = [runId];
     const push = (fragment: string, value: unknown) => {
       values.push(value);
       sets.push(`${fragment} $${values.length}`);
@@ -255,8 +283,57 @@ export class PgPipelineStore implements PipelineStore {
     if (patch.resume_count !== undefined) push("resume_count =", patch.resume_count);
     if (patch.started_at !== undefined) push("started_at =", patch.started_at);
     if (patch.completed_at !== undefined) push("completed_at =", patch.completed_at);
+    return sets;
+  }
+
+  async updateRun(runId: string, patch: Parameters<PipelineStore["updateRun"]>[1]): Promise<void> {
+    const values: unknown[] = [runId];
+    const sets = this.runPatchSets(patch, values);
     const pool = await this.pool();
     await pool.query(`UPDATE pipeline.runs SET ${sets.join(", ")} WHERE run_id = $1`, values);
+  }
+
+  /**
+   * One statement, so the step row and the cursor advance commit together.
+   *
+   * A CTE is enough here: Postgres runs a single statement in its own implicit
+   * transaction, so there is no partial outcome to resume from. Doing it as two
+   * queries left a window where a crash in between meant the step read as "ok"
+   * while step_index still pointed at it, and resume re-ran a side effect that
+   * had already happened.
+   */
+  async commitStep(
+    step: StepRecord,
+    patch: Parameters<PipelineStore["updateRun"]>[1],
+  ): Promise<void> {
+    const values: unknown[] = [step.run_id];
+    const sets = this.runPatchSets(patch, values);
+    const stepParams: string[] = [];
+    for (const v of [
+      step.step_name,
+      step.step_index,
+      step.attempt,
+      step.status,
+      step.state_after === null ? null : assertStateSize(step.state_after),
+      step.error,
+      step.started_at,
+      step.completed_at,
+      step.latency_ms,
+    ]) {
+      values.push(v);
+      stepParams.push(`$${values.length}`);
+    }
+    const pool = await this.pool();
+    await pool.query(
+      `WITH recorded AS (
+         INSERT INTO pipeline.steps
+           (run_id, step_name, step_index, attempt, status, state_after, error,
+            started_at, completed_at, latency_ms)
+         VALUES ($1, ${stepParams.join(", ")})
+       )
+       UPDATE pipeline.runs SET ${sets.join(", ")} WHERE run_id = $1`,
+      values,
+    );
   }
 
   async recordStep(step: StepRecord): Promise<void> {
